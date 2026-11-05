@@ -1,0 +1,1155 @@
+# ===========================================================================
+# CREST 3.0.2 - external-calculator gradient file reused across MTD workers
+# ---------------------------------------------------------------------------
+# Symptom : every `*MTD n` finishes after ~12 s with "terminated EARLY",
+#           then "**ERROR** empty ensemble file crest_dynamics.trj".
+# Cause   : xtb_sc/orca_sc/turbom_sc cached the FULL gradient-file path in
+#           calc%gradfile on the first (trial) call.  parallel.f90 swaps
+#           calc%calcspace to calcspace//"_i" for every worker thread but
+#           does NOT deallocate gradfile/efile, so all workers kept reading
+#           the stale trial-MTD file.  rd_grad_engrad only validates n==nat,
+#           never the coordinates, so the frozen gradient was accepted and
+#           the MD integrated it until SHAKE failed.
+# Fix     : re-derive the path from the CURRENT calc%calcspace on every call,
+#           exactly like the (correct) generic_sc.f90 implementation.
+#
+# The same patch also completes the ORCA subprocess interface (orca_sc.f90):
+# rd_ORCA_wbo() was an unimplemented stub that hard-errored whenever WBOs
+# were requested from an ORCA calculation (reachable via -shake / NCI mode
+# and the wbo/flexi tools).  It now parses ORCA's Mayer bond-order block
+# from ORCA.out  (  B( 0-C , 1-S ) : 1.0550  ), converts the ZERO-based
+# ORCA indices to CREST's one-based convention, symmetrises the matrix and
+# warns (instead of aborting) when the block is absent.
+#
+# And it makes the ORCA template survive: subprocess_types.f90 declared
+#   character(len=:),allocatable :: input(:)      ! deferred-length ARRAY
+# A deferred-length character array COMPONENT is mis-copied when the
+# derived type is assigned (gcc PR fortran/89200, a GCC 9 regression).
+# The calculator settings are copied (tmpcalc = env%calc, calc%add()), so
+# the stored template lines turned into heap garbage and CREST wrote a
+# BINARY ORCA.in - NUL bytes plus fragments of its own banner and string
+# table.  ORCA rejected it with "ERROR: non-ASCII character(s) found in
+# words" and CREST reported only "Initial geometry optimization failed!".
+# Fixed by making the element length fixed (character(len=orca_linelen)).
+# NOTE: that fix is only half the job.  The allocation must be changed in
+# the same step, otherwise you land in gcc PR fortran/113793: with
+#   allocate(self%input(nlines),source=repeat(" ",width))   ! width ~85
+# gfortran <= 13 silently sizes the elements by the SOURCE length instead
+# of the declared one, every later assignment writes 1056 bytes into an
+# ~85-byte element, and the next free() aborts with
+#   "double free or corruption (out)" / SIGABRT in read_orca_input.
+# Hence: allocate(self%input(nlines),source=repeat(" ",orca_linelen)).
+# PR89200 and PR113793 must be fixed TOGETHER.
+# orca_sc.f90 additionally captures ORCA's stderr into ORCA.err instead
+# of discarding it with 2>/dev/null, so a start-up failure is visible.
+# Apply   : git apply -p1 crest-xtbsys-mtd-fix.patch    (from the src/ parent)
+# ===========================================================================
+diff --git a/src/parsing/parse_calcdata.f90 b/src/parsing/parse_calcdata.f90
+--- a/src/parsing/parse_calcdata.f90
++++ b/src/parsing/parse_calcdata.f90
+@@ -89,8 +89,21 @@
+ 
+     included = .false.
+     call calc%reset()
+-    call env%ref%to(moltmp)
+-    call axis(moltmp%nat,moltmp%at,moltmp%xyz)
++    !>--- SAFETY GUARD
++    !> env%ref stores the REFERENCE structure and is only filled once the
++    !> input coordinates have actually been read.  This routine, however,
++    !> is also called while the input file (TOML) is being parsed, which
++    !> happens BEFORE the coordinates are read (see parseflags in
++    !> confparse.f90).  At that point env%ref%nat is undefined and
++    !> env%ref%at / env%ref%xyz are not allocated.  Passing them on to
++    !> axis() dereferences invalid memory and aborts with a SIGSEGV.
++    !> Therefore the reference-dependent orientation is only performed
++    !> when a valid reference structure is available.
++    moltmp%nat = 0
++    if (allocated(env%ref%at).and.allocated(env%ref%xyz)) then
++      call env%ref%to(moltmp)
++      call axis(moltmp%nat,moltmp%at,moltmp%xyz)
++    end if
+ 
+     do i = 1,dict%nblk
+       call blk%deallocate()
+@@ -133,6 +146,20 @@
+       end if
+     end do
+     if (included) then
++      !>--- the calculation setup was read but the reference structure was
++      !> not available at this point. This is fine for plain level
++      !> settings, but anything that refers to individual atoms
++      !> (atom lists, constraints, ...) will not be resolved correctly.
++      if (.not.allocated(env%ref%at)) then
++        write (stdout,'(1x,a)') &
++        & 'NOTE: no reference structure available while reading the calculation setup.'
++        write (stdout,'(1x,a)') &
++        & '      If your input uses atom lists or constraints, add a line'
++        write (stdout,'(1x,a)') &
++        & '      input = "yourcoordinatefile.xyz" to your input file, so that the'
++        write (stdout,'(1x,a)') &
++        & '      coordinates are read before the calculation block is parsed.'
++      end if
+       call calc%init()
+     end if
+     return
+@@ -166,6 +193,56 @@
+     end do
+     return
+   end subroutine parse_leveldata
++
++!>--- LOCAL EXTENSION (2026-09-30) --------------------------------------------!
++!> Append $CREST_GXTB_SOLV to a g-xTB 'other' string.
++!>
++!> Why it lives here as a helper rather than inline: g-xTB can be selected
++!> through TWO doors that both end up in this module's TOML path - the
++!> method="gxtb_dev" case below, and a 'bin'/'flags' pair (where the user writes
++!> '--gxtb' themselves).  The CLI shortcut in calc_type.f90 carries its own
++!> equivalent copy, because parse_calcdata is private and calc_type does NOT
++!> depend on it (the dependency runs the other way, so sharing would need a new
++!> module edge).  If either copy is changed, change the other one too - there
++!> are exactly two, and this comment is the index.
++!>
++!> The flag is a RAW PASSTHROUGH to the external xtb, deliberately: g-xTB's
++!> two models are '--gbe <solvent>' and '--cosmo <solvent>' (see the g-xTB
++!> README), neither of which CREST knows anything about.  Validating the
++!> solvent name here would duplicate xtb's own solvent table and would have to
++!> be updated whenever that table changes - so it is not done; an unknown
++!> solvent is reported by xtb itself.
++!>
++!> Unset or blank => 'other' is left untouched (solvent-free default).
++!> Runs of blanks are collapsed to one so that an accidental '--gbe   thf'
++!> cannot put an empty argument onto the shell command line.
++!------------------------------------------------------------------------------!
++  subroutine append_gxtb_solv(other)
++    implicit none
++    character(len=:),allocatable,intent(inout) :: other
++    character(len=128) :: sv
++    character(len=:),allocatable :: clean
++    integer :: k
++    sv = ' '
++    call getenv('CREST_GXTB_SOLV',sv)
++    if (len_trim(sv) <= 0) return
++    clean = ''
++    do k = 1,len_trim(sv)
++      if (sv(k:k) == ' ') then
++        if (len(clean) > 0.and.clean(len(clean):len(clean)) /= ' ') clean = clean//' '
++      else
++        clean = clean//sv(k:k)
++      end if
++    end do
++    if (len(clean) <= 0) return
++    if (.not.allocated(other)) then
++      other = trim(clean)
++    else
++      other = trim(other)//' '//trim(clean)
++    end if
++    return
++  end subroutine append_gxtb_solv
++
+   subroutine parse_setting_auto(env,job,kv,rd)
+     implicit none
+     type(systemdata),intent(inout) :: env
+@@ -242,10 +319,21 @@
+       case ('pvol','libpvol','pv')
+         job%id = jobtype%libpvol
+       case ('gxtb_dev')  
+-        job%id = jobtype%turbomole 
+-        job%rdgrad = .true.       
+-        job%binary = 'gxtb' 
+-        job%other ='-grad'
++!>--- LOCAL CHANGE (2026-09-30): see the long note in calc_type.f90
++!> (create_calclevel_shortcut).  The current g-xTB package is an xtb 6.7.1 in
++!> which g-xTB is a tblite parameter set, so it belongs on the xtb subprocess
++!> path with an analytical .engrad gradient - NOT on the Turbomole path.
++        job%id = jobtype%xtbsys
++        job%binary = 'xtb'
++        job%other = '--gxtb'
++        job%rdgrad = .true.
++!>--- LOCAL EXTENSION (2026-09-30): g-xTB solvation passthrough.  MUST stay in
++!> sync with the CLI branch in create_calclevel_shortcut (calc_type.f90) - both
++!> end up here, and dropping it from either one makes the option silently
++!> depend on how the run was launched.  A 'flags' key later in the same TOML
++!> block would overwrite job%other wholesale, so this has to come BEFORE that
++!> key is processed (see the 'flags' case below).
++        call append_gxtb_solv(job%other)
+       case ('none')
+         job%id = jobtype%unknown
+       case ('lj','lennard-jones')
+@@ -262,6 +350,16 @@
+ 
+     case ('flags')
+       job%other = kv%value_c
++!>--- LOCAL EXTENSION (2026-09-30): this key OVERWRITES job%other, so it would
++!> wipe out anything method='gxtb_dev' appended above - note that 'flags' wins
++!> over 'method' only because the key order inside the block happens to put it
++!> last; the intent is the user's explicit flags plus the solvation passthrough,
++!> which is also what the CLI path does.  Re-append so $CREST_GXTB_SOLV survives
++!> a hand-written '--gxtb' here.  Harmless for every other calculator: the
++!> helper returns immediately when the variable is unset.
++      if (allocated(job%other)) then
++        if (index(job%other,'--gxtb') /= 0) call append_gxtb_solv(job%other)
++      end if
+ 
+       !> don't.
+       !case ('sys','syscall','systemcall')
+diff --git a/src/calculator/xtb_sc.f90 b/src/calculator/xtb_sc.f90
+--- a/src/calculator/xtb_sc.f90
++++ b/src/calculator/xtb_sc.f90
+@@ -222,22 +222,32 @@
+ 
+     iostatus = 0
+ 
+-    if (.not.allocated(calc%gradfile)) then
+-      if (allocated(calc%calcspace)) then
+-        calc%gradfile = trim(calc%calcspace)//sep//gf
+-      else
+-        calc%gradfile = gf
+-      end if
+-    end if
+-
+-    inquire (file=calc%gradfile,exist=ex)
++    !>--- NOTE: calc%gradfile only holds the file NAME (or a user supplied
++    !> name).  The path prefix has to be re-derived from the CURRENT
++    !> calc%calcspace on EVERY call - exactly as it is done in
++    !> generic_sc.f90.  Caching the full path here (as was done before) is
++    !> broken for parallel runs: parallel.f90 switches calcspace per worker
++    !> thread, but the cached string was copied along with the settings, so
++    !> all workers kept reading the gradient file of whatever calcspace was
++    !> active first (typically the preliminary trial MTD).  The MD then
++    !> silently integrates a FROZEN gradient, distorts the geometry and
++    !> dies after a few dozen steps with "*MTD n terminated EARLY".
++    if (.not.allocated(calc%gradfile)) calc%gradfile = gf
++
++    if (allocated(calc%calcspace)) then
++      atmp = trim(calc%calcspace)//sep//trim(calc%gradfile)
++    else
++      atmp = trim(calc%gradfile)
++    end if
++
++    inquire (file=atmp,exist=ex)
+     if (.not.ex) then
+       iostatus = 1
+       return
+     end if
+ 
+     c = 0
+-    open (newunit=ich,file=calc%gradfile)
++    open (newunit=ich,file=atmp)
+     call rd_grad_engrad(ich,mol%nat,energy,grad,iostatus)
+     close (ich)
+ 
+diff --git a/src/calculator/orca_sc.f90 b/src/calculator/orca_sc.f90
+--- a/src/calculator/orca_sc.f90
++++ b/src/calculator/orca_sc.f90
+@@ -25,6 +25,7 @@
+   use iso_fortran_env,only:wp => real64,stderr => error_unit
+   use strucrd
+   use calc_type
++  use orca_type,only:orca_nprocs,orca_omp_threads_string
+   use iomod,only:makedir,directory_exist,remove,command
+   implicit none
+   !>--- private module variables and parameters
+@@ -37,6 +38,7 @@
+   character(len=11),parameter :: gf = 'ORCA.engrad'
+ 
+   public :: ORCA_engrad
++  public :: ORCA_sp
+ 
+ !========================================================================================!
+ !========================================================================================!
+@@ -89,8 +91,64 @@
+   end subroutine ORCA_engrad
+ 
+ !========================================================================================!
+-
+-  subroutine ORCA_setup(mol,calc)
++!========================================================================================!
++!> ORCA_sp: the SAME run, but WITHOUT the gradient.
++!>
++!> WHY: crest_sploop() - the "Singlepoint re-ranking for N structures" stage of
++!> the refine - only ever uses the ENERGY.  It calls engrad(), ORCA therefore
++!> writes an EnGrad job, and the gradient it computes is thrown away: the
++!> gradient array in crest_sploop is filled and then deallocated without ever
++!> being read.  For a DFT level with a solvation model that is a CP-SCF /
++!> Z-vector solve plus the CPCM gradient contribution, on every single structure
++!> of the ensemble, for nothing.
++!>
++!> HOW: ORCA_setup() writes the template with the EnGrad keyword stripped, and
++!> the energy is read back from the "FINAL SINGLE POINT ENERGY" line of ORCA.out
++!> instead of from ORCA.engrad.  Everything else (calculation space, system
++!> call, MPI/%pal block, WBO reading) is identical to ORCA_engrad().
++!========================================================================================!
++  subroutine ORCA_sp(mol,calc,energy,iostatus)
++    use iso_fortran_env,only:wp => real64
++    use strucrd
++    use calc_type
++    use iomod,only:makedir,directory_exist,remove
++
++    implicit none
++    type(coord) :: mol
++    type(calculation_settings) :: calc
++    real(wp),intent(inout) :: energy
++    integer,intent(out) :: iostatus
++
++    iostatus = 0
++
++    !>--- setup system call information (input file WITHOUT EnGrad)
++    !$omp critical
++    call ORCA_setup(mol,calc,nogr=.true.)
++    !$omp end critical
++
++    !>--- do the systemcall
++    call initsignal()
++    call command(calc%systemcall,iostatus)
++    if (iostatus /= 0) return
++
++    !>--- read the energy from ORCA.out
++    !$omp critical
++    call rd_ORCA_energy(mol,calc,energy,iostatus)
++    !$omp end critical
++    if (iostatus /= 0) return
++
++    !>--- read WBOs? (only if requested; see rd_ORCA_wbo)
++    !$omp critical
++    call rd_ORCA_wbo(mol,calc,iostatus)
++    !$omp end critical
++    if (iostatus /= 0) return
++
++    return
++  end subroutine ORCA_sp
++
++!========================================================================================!
++
++  subroutine ORCA_setup(mol,calc,nogr)
+ !***********************************
+ !* Write ORCA inputs, and construct
+ !* subprocess call
+@@ -102,13 +160,25 @@
+     implicit none
+     type(coord) :: mol
+     type(calculation_settings) :: calc
++!>--- LOCAL EXTENSION: nogr = .true. writes the template WITHOUT the EnGrad
++!> keyword (see ORCA_sp).  Optional: the existing call passes nothing and keeps
++!> writing EnGrad exactly as before.
++    logical,intent(in),optional :: nogr
+ 
+     integer :: l
++    integer :: np
++    logical :: sponly
+     character(len=:),allocatable :: fname
+     character(len=:),allocatable :: cpath
+     character(len=10) :: num
+-    integer :: i,j,k,ich,och,io
++    character(len=256) :: ompstr   !> "<N>" thread budget handed to the ORCA child
++    character(len=256) :: envstr   !> scratch for reading environment switches
++    character(len=256) :: argstr   !> extra args passed straight through to ORCA/MPI
++    character(len=512) :: mpiargs  !> ALL extra MPI switches, to be quoted as ONE argv entry
++    integer :: i,j,k,ich,och,io,ival
+     logical :: ex
++    logical,save :: callprinted = .false.  !> CREST_ORCA_PRINT_CALL: print the call once
++    logical,save :: optstartprinted = .false.  !> "optimization starting" mark, printed once
+ 
+     call initsignal()
+ 
+@@ -156,7 +226,9 @@
+       fname = calc%calcfile
+     end if
+     if(calc%uhf < 1) calc%uhf = 1 !> ORCA uses multiplicity, not n_alpha - n_beta!
+-    call calc%ORCA%write(fname,mol,calc%chrg,calc%uhf)
++    sponly = .false.
++    if (present(nogr)) sponly = nogr
++    call calc%ORCA%write(fname,mol,calc%chrg,calc%uhf,sponly)
+     deallocate (fname)
+ 
+ !>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<!
+@@ -165,24 +237,130 @@
+ !>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<!
+ 
+     !>--- construct path information for sys-call
++    !> ORCA parallelises over MPI (the %pal block that write_orca_input injects).
++    !> By default it must NOT additionally pick up the OpenMP/MKL budget CREST
++    !> exported for the child: N ranks x N threads would be N*N runnable threads
++    !> per job, so the thread layer of the ORCA child is pinned to 1.
++    !>
++    !> EXCEPTION / tuning knob: for small levels of theory (minimal basis such as
++    !> MINIX) MPI hardly pays off - every SCF iteration then spends more time in
++    !> Allreduce of the Fock matrix than in actual work.  In that regime
++    !>     CREST_ORCA_NPROCS=1 CREST_ORCA_OMP_THREADS=8
++    !> (no %pal at all + 8 threads inside one process) can be markedly faster than
++    !> 8 MPI ranks.  Try both; the default below stays at 1 thread per rank.
+     if (allocated(calc%calcspace)) then
+       calc%systemcall = 'cd '//calc%calcspace//' &&'
+-      calc%systemcall = trim(calc%systemcall)//' '//trim(calc%binary)
+     else
+-      calc%systemcall = trim(calc%binary)
+-    end if
+-
+-    calc%systemcall = trim(calc%systemcall)//' ORCA.in' 
+-       
+-    if(calc%ORCA%mpi .and. index(calc%binary,'oversubscribe').eq.0)then
+-      calc%systemcall = trim(calc%systemcall)//' --oversubscribe'
++      calc%systemcall = ''
++    end if
++    call orca_omp_threads_string(ompstr)
++    calc%systemcall = trim(calc%systemcall)//trim(ompstr)
++    calc%systemcall = trim(calc%systemcall)//' '//trim(calc%binary)
++
++    calc%systemcall = trim(calc%systemcall)//' ORCA.in'
++
++!>--- LOCAL FIX: ORCA accepts at most TWO command line arguments
++!>        orca <input>  "<additional mpi parameters>"
++!>    Everything after the input file has to reach the ORCA driver as ONE single
++!>    quoted string - that is how ORCA forwards it to the mpirun it spawns
++!>    internally (see the ORCA manual: `$(which orca) inp.inp "optional openmpi
++!>    arguments"`).  Appending the switches as separate words makes the driver
++!>    abort before it ever touches the input file:
++!>        "ORCA: too many arguments -
++!>         Additional mpi parameters have to be given as a single string!"
++!>    which is exactly what CREST_ORCA_MPI_ARGS='--bind-to core' produced
++!>    (argv = ORCA.in | --oversubscribe | --bind-to | core  = 3 extra args).
++!>    => collect every switch first, then quote the lot exactly once.
++    mpiargs = ''
++    np = orca_nprocs()
++    if((calc%ORCA%mpi .or. np > 1).and.index(calc%binary,'oversubscribe').eq.0)then
++      !> OpenMPI disables process binding once it is told to oversubscribe, which
++      !> can cost a surprising amount of performance.  CREST_ORCA_NO_OVERSUBSCRIBE
++      !> drops the flag if the node has enough free slots anyway.
++      call getenv('CREST_ORCA_NO_OVERSUBSCRIBE',envstr)
++      ival = 0   !> a failed internal READ leaves the variable UNCHANGED, and
++      !> Fortran's .and./.or. do not guarantee short-circuit evaluation, so the
++      !> value has to be defined before the test below can look at it
++      read (envstr,*,iostat=io) ival
++      !> DEFAULT ON.  Only an explicit non-zero value drops the flag; an unset
++      !> or unparsable value keeps it.  (The old test was
++      !> 'len_trim(envstr) == 0', i.e. ANY non-empty value disabled
++      !> --oversubscribe - so CREST_ORCA_NO_OVERSUBSCRIBE=0 did the exact
++      !> opposite of what its name says.)
++      if (io /= 0.or.ival == 0) then
++        mpiargs = '--oversubscribe'
++      end if
+     endif
+ 
++    !>--- anything else the site needs passed straight through to ORCA/MPI,
++    !> e.g. "--bind-to core" to restore pinning after --oversubscribe.
++    !> NOTE: give the switches WITHOUT surrounding quotes now - CREST adds them.
++    !> (A value that is already quoted is passed through untouched, so older
++    !>  configs like CREST_ORCA_MPI_ARGS='"--bind-to core"' keep working.)
++    call getenv('CREST_ORCA_MPI_ARGS',argstr)
++    if (len_trim(argstr) > 0) then
++      if (len_trim(mpiargs) > 0) then
++        mpiargs = trim(mpiargs)//' '//trim(argstr)
++      else
++        mpiargs = trim(argstr)
++      end if
++    end if
++    if (len_trim(mpiargs) > 0) then
++      l = len_trim(mpiargs)
++      if (mpiargs(1:1) == '"'.and.mpiargs(l:l) == '"') then
++        calc%systemcall = trim(calc%systemcall)//' '//trim(mpiargs)
++      else
++        calc%systemcall = trim(calc%systemcall)//' "'//trim(mpiargs)//'"'
++      end if
++    end if
++
+     !>--- add printout information
++    !> NOTE: the other subprocess calculators append dev0 (' 2>/dev/null') and
++    !> therefore THROW AWAY the child's stderr.  For ORCA that is fatal for
++    !> debugging: a broken start-up (LD_LIBRARY_PATH not set -> "error while
++    !> loading shared libraries: libmpi.so.40", wrong binary path, license
++    !> problem) reports ONLY on stderr and never reaches ORCA.out.  CREST then
++    !> just sees a missing ORCA.engrad and aborts with the opaque
++    !> "Initial geometry optimization failed!".  Keep the message instead: it is
++    !> cheap and it is the first file to look at when ORCA fails.  The file is
++    !> created inside calc%calcspace, i.e. next to ORCA.in/ORCA.out.
+     calc%systemcall = trim(calc%systemcall)//' '//'> ORCA.out'
+-    calc%systemcall = trim(calc%systemcall)//trim(dev0)
+-
+-    !write (*,*) calc%systemcall
++    calc%systemcall = trim(calc%systemcall)//' 2> ORCA.err'
++
++!>--- LOCAL EXTENSION: opt-in echo of the command line CREST is about to run.
++!> Set CREST_ORCA_PRINT_CALL=1 to see it; 0 or unset suppresses it.  This is the
++!> fastest way to settle "what is CREST actually executing?" - a mis-quoted or
++!> mis-assembled call is otherwise invisible, because ORCA.out only contains
++!> ORCA's own complaints.
++!> Printed once per process (the same string is built for every worker anyway).
++    call getenv('CREST_ORCA_PRINT_CALL',envstr)
++    ival = 0   !> see the note above: a failed READ must not leave ival undefined
++    read (envstr,*,iostat=io) ival
++    !> DEFAULT OFF, and the switch is the VALUE, not the mere presence of the
++    !> variable - the same convention as CREST_DYNAMIC_SHARE in parallel.f90
++    !> ('read(val,*,iostat=r); if (r == 0.and.ival == 0) return').  The old test
++    !> was 'len_trim(envstr) > 0', which reads any non-empty value as "on", so
++    !> CREST_ORCA_PRINT_CALL=0 printed the very line it was meant to suppress.
++    !> Only integers are honoured; an unset or unparsable value leaves it off.
++    if (io == 0.and.ival /= 0.and..not.callprinted) then
++      callprinted = .true.
++      write (stdout,'(a)') 'ORCA call: '//trim(calc%systemcall)
++      flush (stdout)
++    end if
++!>--- LOCAL EXTENSION: mark the start of the initial geometry optimization.
++!> The FIRST ORCA call of every CREST run is always made from inside that
++!> optimization, and it is the one stage that stays completely silent until it
++!> is finished (17 min and more with a real DFT level - nothing else in the
++!> log tells where the time went).  So print the "starting" line directly
++!> behind the echo above; with CREST_ORCA_PRINT_CALL unset it still lands
++!> between the "Initial Geometry Optimization" header and the run hashes of
++!> ORCA itself, i.e. exactly where the silence used to be.
++!> Printed once per process (same reasoning as the echo above).
++    if (.not.optstartprinted) then
++      optstartprinted = .true.
++      write (stdout,'(1x,a)') 'optimization starting ...'
++      flush (stdout)
++    end if
+     return
+   end subroutine ORCA_setup
+ 
+@@ -218,22 +396,28 @@
+ 
+     iostatus = 0
+ 
+-    if (.not.allocated(calc%gradfile)) then
+-      if (allocated(calc%calcspace)) then
+-        calc%gradfile = trim(calc%calcspace)//sep//gf
+-      else
+-        calc%gradfile = gf
+-      end if
+-    end if
+-
+-    inquire (file=calc%gradfile,exist=ex)
++    !>--- NOTE: calc%gradfile only holds the file NAME (or a user supplied
++    !> name).  The path prefix has to be re-derived from the CURRENT
++    !> calc%calcspace on EVERY call - cp. generic_sc.f90.  Caching the full
++    !> path breaks parallel runs, where calcspace is switched per worker
++    !> thread (see parallel.f90): all workers would read the same stale
++    !> gradient file.  See the comment in xtb_sc.f90 for the full story.
++    if (.not.allocated(calc%gradfile)) calc%gradfile = gf
++
++    if (allocated(calc%calcspace)) then
++      atmp = trim(calc%calcspace)//sep//trim(calc%gradfile)
++    else
++      atmp = trim(calc%gradfile)
++    end if
++
++    inquire (file=atmp,exist=ex)
+     if (.not.ex) then
+       iostatus = 1
+       return
+     end if
+ 
+     c = 0
+-    open (newunit=ich,file=calc%gradfile)
++    open (newunit=ich,file=atmp)
+     call rd_grad_engrad(ich,mol%nat,energy,grad,iostatus)
+     close (ich)
+ 
+@@ -241,29 +425,224 @@
+   end subroutine rd_ORCA_engrad
+ 
+ !========================================================================================!
++!> rd_ORCA_energy: read ONLY the energy, from ORCA.out, for a gradient-free run.
++!>
++!> WHY: with the EnGrad keyword stripped from the template (see write_orca_input
++!> and ORCA_sp) ORCA does not write an ORCA.engrad file at all, so there is
++!> nothing for rd_ORCA_engrad() to read.  ORCA nevertheless prints the total
++!> energy of the converged SCF in the "FINAL SINGLE POINT ENERGY" line of its
++!> standard output, and that value is exactly the one it would have put into the
++!> .engrad file, so the two are interchangeable.
++!>
++!> NOTE ON THE PATH: calc%calcspace is switched per worker thread in parallel
++!> runs (see parallel.f90), so - exactly as in rd_ORCA_engrad() above and in
++!> rd_ORCA_wbo() below - the path prefix is re-derived from the CURRENT
++!> calcspace on EVERY call.  Never cache it.
++!========================================================================================!
++  subroutine rd_ORCA_energy(mol,calc,energy,iostatus)
++    use iso_fortran_env,only:wp => real64
++    use strucrd
++    use calc_type
++    use iomod,only:makedir,directory_exist,remove
++
++    implicit none
++    type(coord) :: mol
++    type(calculation_settings) :: calc
++    real(wp),intent(inout) :: energy
++    integer,intent(out) :: iostatus
++
++    character(len=*),parameter :: KEY = 'FINAL SINGLE POINT ENERGY'
++    character(len=:),allocatable :: outfile
++    character(len=1024) :: atmp
++    integer :: ich,io,p,nfound
++    logical :: ex
++    real(wp) :: dum
++
++    call initsignal()
++
++    iostatus = 0
++
++    !>--- locate the output file of the corresponding ORCA run
++    if (allocated(calc%calcspace)) then
++      outfile = trim(calc%calcspace)//sep//'ORCA.out'
++    else
++      outfile = 'ORCA.out'
++    end if
++
++    inquire (file=outfile,exist=ex)
++    if (.not.ex) then
++      write (stderr,'(3a)') '**WARNING** ORCA output ',trim(outfile),&
++              & ' not found - cannot read energy'
++      iostatus = 1
++      return
++    end if
++
++    !>--- scan the output.  The LAST occurrence wins: an ORCA run that restarts
++    !> or prints several SCFs (e.g. a compound job) repeats the line, and the
++    !> final one is the converged result that would have gone into ORCA.engrad.
++    nfound = 0
++    open (newunit=ich,file=outfile)
++    do
++      read (ich,'(a)',iostat=io) atmp
++      if (io /= 0) exit
++      p = index(atmp,KEY)
++      if (p == 0) cycle
++      read (atmp(p+len(KEY):),*,iostat=io) dum
++      if (io /= 0) cycle
++      energy = dum
++      nfound = nfound+1
++    end do
++    close (ich)
++
++    if (nfound == 0) then
++      write (stderr,'(3a)') '**WARNING** no "',KEY,'" line found in '//trim(outfile)
++      write (stderr,'(a)') '            The ORCA run most likely did not converge.'
++      iostatus = 1
++      return
++    end if
++
++    return
++  end subroutine rd_ORCA_energy
++
++!========================================================================================!
+ 
+   subroutine rd_ORCA_wbo(mol,calc,iostatus)
++!**************************************************
++!* Read Wiberg/Mayer bond orders from the ORCA
++!* output file written by ORCA_setup (i.e. ORCA.out).
++!*
++!* ORCA prints the Mayer bond orders as
++!*     Mayer bond orders larger than 0.1
++!*     B( 0-C , 1-S ) : 1.0550
++!* i.e. with ZERO-based atom indices; those are
++!* converted to the one-based CREST convention here.
++!* The block is emitted whenever the Mayer population
++!* analysis is active, which is the ORCA default and
++!* can be forced with "! MAYER" in the input template.
++!* If no bond orders are found a warning is issued but
++!* the run is NOT aborted: WBOs only influence SHAKE
++!* and the topology handling, never the energies.
++!**************************************************
++    use iso_fortran_env,only:wp => real64
++    use strucrd
++    use calc_type
++
+     implicit none
+     type(coord) :: mol
+     type(calculation_settings) :: calc
+     integer,intent(out) :: iostatus
+ 
++    character(len=:),allocatable :: wbofile
++    character(len=1024) :: atmp,inside,left,right
++    integer :: i,j,p1,p2,pc,p3,ich,io,nwbo
++    logical :: ex
+     real(wp) :: dum
+-    character(len=:),allocatable :: wbofile
+-    character(len=128) :: atmp
+-
+-    integer :: i,j,k,l,ich,och,io
+-    logical :: ex
++
+     call initsignal()
++
+     iostatus = 0
+-    if(calc%rdwbo)then
+-    iostatus = 1
+-    write (stderr,'(a)') '**ERROR** ORCA bond order reader not yet implemented'
+-    endif
++    if (.not.calc%rdwbo) return
++
++    !>--- locate the output file of the corresponding ORCA run
++    if (allocated(calc%calcspace)) then
++      wbofile = trim(calc%calcspace)//sep//'ORCA.out'
++    else
++      wbofile = 'ORCA.out'
++    end if
++
++    inquire (file=wbofile,exist=ex)
++    if (.not.ex) then
++      write (stderr,'(3a)') '**WARNING** ORCA output ',trim(wbofile),&
++              & ' not found - cannot read bond orders'
++      iostatus = 1
++      return
++    end if
++
++    if (allocated(calc%wbo)) deallocate (calc%wbo)
++    allocate (calc%wbo(mol%nat,mol%nat),source=0.0_wp)
++
++    nwbo = 0
++    open (newunit=ich,file=wbofile)
++    do
++      read (ich,'(a)',iostat=io) atmp
++      if (io /= 0) exit
++      !>--- only consider lines of the form  B( i-X , j-Y ) : value
++      if (index(atmp,'B(') == 0) cycle
++      if (index(atmp,':') == 0) cycle
++      p1 = index(atmp,'(')
++      p2 = index(atmp,')')
++      if (p1 == 0 .or. p2 <= p1) cycle
++      inside = atmp(p1+1:p2-1)
++      pc = index(inside,',')
++      if (pc <= 1) cycle
++      left = adjustl(inside(1:pc-1))
++      right = adjustl(inside(pc+1:))
++      i = extract_leading_int(left)
++      j = extract_leading_int(right)
++      if (i < 0 .or. j < 0) cycle
++      if (i >= mol%nat .or. j >= mol%nat) cycle
++      !>--- numerical value is printed after the colon
++      p3 = index(atmp(p2:),':')
++      if (p3 == 0) cycle
++      read (atmp(p2+p3:),*,iostat=io) dum
++      if (io /= 0) cycle
++      !>--- ORCA counts atoms from zero, CREST from one
++      calc%wbo(i+1,j+1) = dum
++      calc%wbo(j+1,i+1) = dum
++      nwbo = nwbo+1
++    end do
++    close (ich)
++
++    if (nwbo == 0) then
++      write (stderr,'(3a)') '**WARNING** no Mayer bond orders found in ',&
++              & trim(wbofile),' - WBOs set to zero.'
++      write (stderr,'(a)') '            Add "! MAYER" to the ORCA input template if WBOs are required.'
++    end if
++
+     return
+   end subroutine rd_ORCA_wbo
+ 
+ !========================================================================================!
++
++  integer function extract_leading_int(str)
++!**************************************************
++!* Return the first unsigned integer that appears in
++!* a string, or -1 if there is none.  Used to parse
++!* the "i-Element" tokens of the ORCA Mayer bond
++!* order printout (e.g. "0-C" -> 0, "12-H" -> 12).
++!**************************************************
++    implicit none
++    character(len=*),intent(in) :: str
++    integer :: k,p,last
++
++    extract_leading_int = -1
++
++    !>--- position of the first digit
++    p = 0
++    do k = 1,len_trim(str)
++      if (str(k:k) >= '0' .and. str(k:k) <= '9') then
++        p = k
++        exit
++      end if
++    end do
++    if (p == 0) return
++
++    !>--- end of the digit run
++    last = p
++    do k = p+1,len_trim(str)
++      if (str(k:k) < '0' .or. str(k:k) > '9') exit
++      last = k
++    end do
++
++    !>--- accumulate the value (no internal I/O / no read -> compiler-proof)
++    extract_leading_int = 0
++    do k = p,last
++      extract_leading_int = extract_leading_int*10+(iachar(str(k:k))-iachar('0'))
++    end do
++
++  end function extract_leading_int
++
++!========================================================================================!
+ !========================================================================================!
+ end module orca_sc
+ 
+diff --git a/src/calculator/subprocess_types.f90 b/src/calculator/subprocess_types.f90
+--- a/src/calculator/subprocess_types.f90
++++ b/src/calculator/subprocess_types.f90
+@@ -27,19 +27,119 @@
+   implicit none
+   public
+ 
++  !> Maximum length of one ORCA template line.  This is the same size as the
++  !> scratch buffer the reader below reads a line into, so a template line can
++  !> never exceed it.
++  integer,parameter :: orca_linelen = 1056
++
++  !>--- NOTE on the element type of "input":
++  !> "input" is an ALLOCATABLE ARRAY OF FIXED-LENGTH STRINGS on purpose - do NOT
++  !> turn it into "character(len=:),allocatable :: input(:)".
++  !> A deferred-length character ARRAY component is silently mis-copied when the
++  !> surrounding derived type is assigned (gcc PR fortran/89200, a GCC 9
++  !> regression; ifort/ifx have the same trap).  After the copy the elements no
++  !> longer reference the template but stale heap memory.
++  !> CREST hits this because calculation_settings objects get copied around
++  !> (tmpcalc = env%calc in setuptest.f90, calc%add() while parsing the TOML),
++  !> and this is the ONLY deferred-length character array component in the whole
++  !> code base - which is why the damage is confined to the ORCA template.
++  !> Symptom: ORCA.in is written full of NUL bytes plus fragments of CREST's own
++  !> memory (the banner, the jobdescription() table, the systemcall string).
++  !> ORCA then aborts with
++  !>   ERROR: non-ASCII character(s) found in words in line ...
++  !>   [qcscan1.cpp, line 264]: Please remove all non-ASCII characters
++  !> and CREST only reports the opaque "Initial geometry optimization failed!".
++  !> Fixed-length elements are copied by a plain memcpy and cannot be mangled.
+   type :: orca_input
+     character(len=:),allocatable :: cmd
+     integer :: nlines = 0
+-    character(len=:),allocatable :: input(:)
++    character(len=orca_linelen),allocatable :: input(:)
+     logical :: mpi = .false.
+   contains
+     procedure :: read => read_orca_input
+     procedure :: write => write_orca_input
+   end type orca_input
+ 
++!>=======================================================================================
++!> "engrad" handling.  Three things need it:
++!>   * read_orca_input()  - must RECOGNISE an existing EnGrad so it does not
++!>     append a second one (case-insensitively!)
++!>   * write_orca_input() - must be able to REMOVE it again when the caller only
++!>     wants an energy (singlepoint(), i.e. calc%nogr)
++!> Both work on the raw keyword line, so the matching has to be case-insensitive:
++!> ORCA spells it "EnGrad" in its own manual and accepts any capitalisation.
++!>=======================================================================================
++  character(len=6),parameter :: ENG = 'engrad'
++
+ !========================================================================================!
+ !========================================================================================!
+ contains  !> MODULE PROCEDURES START HERE
++!========================================================================================!
++!========================================================================================!
++
++!---------------------------------------------------------------------------------------!
++!> is the (sub)string "engrad" present in line, regardless of capitalisation?
++!---------------------------------------------------------------------------------------!
++  pure function has_engrad(line) result(found)
++    implicit none
++    character(len=*),intent(in) :: line
++    logical :: found
++    integer :: i,n
++    found = .false.
++    n = len_trim(line)
++    do i = 1,n-len(ENG)+1
++      if (locase(line(i:i+len(ENG)-1)) == ENG) then
++        found = .true.
++        return
++      end if
++    end do
++  end function has_engrad
++
++!---------------------------------------------------------------------------------------!
++!> lowercase a short string (only A-Z are mapped, everything else is kept)
++!---------------------------------------------------------------------------------------!
++  pure function locase(str) result(out)
++    implicit none
++    character(len=*),intent(in) :: str
++    character(len=len(str)) :: out
++    integer :: i,ic
++    out = str
++    do i = 1,len_trim(str)
++      ic = iachar(out(i:i))
++      if (ic >= iachar('A').and.ic <= iachar('Z')) out(i:i) = char(ic+32)
++    end do
++  end function locase
++
++!---------------------------------------------------------------------------------------!
++!> remove the FIRST "engrad" (any capitalisation) from line, plus one adjacent
++!> blank.  Used to turn an EnGrad template into a plain single point template.
++!---------------------------------------------------------------------------------------!
++  function strip_engrad(line) result(out)
++    implicit none
++    character(len=*),intent(in) :: line
++    character(len=len(line)) :: out
++    integer :: i,j,n
++    out = line
++    n = len(ENG)
++    do i = 1,len_trim(out)-n+1
++      if (locase(out(i:i+n-1)) == ENG) then
++!>--- drop one of the two surrounding blanks as well, so "! PBE EnGrad def2"
++!> becomes "! PBE def2" and not "! PBE  def2"
++        j = i+n
++        if (j <= len_trim(out)) then
++          if (out(j:j) == ' ') then
++            out = out(:i-1)//out(j+1:)
++          else
++            out = out(:i-1)//out(j:)
++          end if
++        else
++          out = out(:i-1)
++        end if
++        return
++      end if
++    end do
++  end function strip_engrad
++
+ !========================================================================================!
+ !========================================================================================!
+ 
+@@ -59,6 +159,14 @@
+       error stop
+     else
+       write (stdout,'(3a)') 'Reading ORCA input template ',fname,' ...'
++!>--- LOCAL EXTENSION: frame the template with the same '*' banner that the
++!> TOML echo in parse_datastruct.f90 (root_print2) uses, instead of the '|'
++!> bars we used before.  CREST now echoes THREE kinds of input file (TOML,
++!> every ORCA template, and the constraining file) and they all have to look
++!> alike, otherwise the log is unreadable.
++      write (stdout,'(a)') repeat('*',80)
++      write (stdout,'("*",1x,a,a,a)') 'INPUT FILE ',trim(fname),' content (without comments):'
++      write (stdout,'(a)') repeat('*',80)
+     end if
+     nlines = getlines(fname,width)
+     open (newunit=ich,file=fname)
+@@ -69,6 +177,13 @@
+     do
+       read (ich,'(a)',iostat=io) atmp
+       if (io /= 0) exit  !> EOF
++!>--- LOCAL EXTENSION: echo the template verbatim into the log.
++!> Upstream only said "Reading ORCA input template orca.inp ...", so a log file
++!> never contained the method/basis/convergence settings that were actually
++!> used - and for a multi-level setup (orca.inp vs. orca-high.inp) there was no
++!> way to tell afterwards which file held which keywords.  Dumped BEFORE the
++!> adjustl()+lowercase() below, i.e. exactly as it is on disk.
++      write (stdout,'("*",1x,a)') trim(atmp)
+       atmp = adjustl(lowercase(atmp))
+ 
+       !> ignore coord lines, CREST will write those
+@@ -90,7 +205,11 @@
+       end if
+ 
+       !> check runtypes from the simple input line
+-      if (atmp(1:1) .eq. '!'.and.index(atmp,'engrad') .ne. 0) then
++!>--- LOCAL FIX: index() is CASE SENSITIVE, so a template written as "EnGrad"
++!> (the spelling in the ORCA manual) was not recognised here and CREST appended
++!> a SECOND EnGrad below -> "! ... EnGrad EnGrad".  Harmless for ORCA but it
++!> makes the generated ORCA.in contradict the template the user wrote.
++      if (atmp(1:1) .eq. '!'.and.has_engrad(atmp)) then
+         gotengrad = .true.
+       end if
+       if (atmp(1:1) .eq. '!'.and.index(atmp,'md') .ne. 0) then
+@@ -121,10 +240,18 @@
+       end if
+     end do
+     close (ich)
+-
+-    !> allocate memory space
+-    width = width+10
+-    allocate (self%input(nlines),source=repeat(" ",width))
++    write (stdout,'(a)') repeat('*',80)
++
++    !> allocate memory space.  The element length is FIXED (orca_linelen) - see
++    !> the note on type(orca_input): a deferred-length character array component
++    !> is corrupted by the derived-type copy, which is what produced a binary
++    !> ORCA.in.
++    !> The SOURCE= length MUST equal orca_linelen: with a shorter SOURCE,
++    !> gfortran <= 13 sizes the elements by the SOURCE length instead of the
++    !> declared element length (gcc PR fortran/113793), so each later
++    !> "self%input(k) = trim(atmp)" writes past the element and the next free()
++    !> aborts with "double free or corruption (out)".  GCC 14 fixed this.
++    allocate (self%input(nlines),source=repeat(" ",orca_linelen))
+     self%nlines = nlines
+ 
+     !> Open file from the beginning and read into memory
+@@ -163,25 +290,111 @@
+   end subroutine read_orca_input
+ 
+ !========================================================================================!
+-
+-  subroutine write_orca_input(self,fname,mol,chrg,mult)
++!> How many MPI ranks the ORCA child should use
++!========================================================================================!
++
++  !>---------------------------------------------------------------------------
++  !> The core budget CREST has reserved for THIS call, translated into ORCA's
++  !> own parallelisation keyword.
++  !>
++  !> new_ompautoset() (ompmklset.F90) hands "cores_per_job" to every EXTERNAL
++  !> program through OMP_NUM_THREADS, and it already IS the fair share:
++  !>   'max'         -> T       : trialOPT (initial optimisation), singlepoints
++  !>   'auto',nall   -> T/nall  : ensemble optimisations, MTD/MD workers
++  !> ORCA however parallelises over MPI and needs an explicit
++  !>     %pal
++  !>       nprocs N
++  !>     end
++  !> block - it never looks at OMP_NUM_THREADS, which is exactly why an
++  !> unpatched CREST+ORCA run uses ONE core regardless of -T.
++  !> Override with CREST_ORCA_NPROCS (e.g. to cap the ranks per job).
++  !>---------------------------------------------------------------------------
++  integer function orca_nprocs() result(np)
++    implicit none
++    character(len=64) :: val
++    integer :: r
++    call getenv('CREST_ORCA_NPROCS',val)
++    read (val,*,iostat=r) np
++    if (r /= 0) then
++      call getenv('OMP_NUM_THREADS',val)
++      read (val,*,iostat=r) np
++      if (r /= 0) np = 1
++    end if
++    np = max(np,1)
++  end function orca_nprocs
++
++!========================================================================================!
++!>---------------------------------------------------------------------------
++!> How many OpenMP/MKL threads the ORCA *child* gets.
++!>
++!> NOTE: this is deliberately NOT tied to the number of MPI ranks.  Many ranks
++!> are only worth it if the per-iteration work is large; for a minimal basis
++!> (MINIX) and a few hundred basis functions, 8 MPI processes usually LOSE
++!> against 1 process with 8 threads - every SCF iteration pays an Allreduce of
++!> the Fock matrix, which is pure overhead at that size.
++!>
++!> CREST_ORCA_OMP_THREADS=N  -> export OMP/MKL/OPENBLAS_NUM_THREADS=N
++!>                              for the ORCA child (default: 1)
++!>---------------------------------------------------------------------------
++  subroutine orca_omp_threads_string(str)
++    implicit none
++    character(len=*),intent(out) :: str
++    character(len=64) :: val
++    integer :: n,r
++    n = 1
++    call getenv('CREST_ORCA_OMP_THREADS',val)
++    read (val,*,iostat=r) n
++    if (r /= 0) n = 1
++    n = max(n,1)
++    write (str,'(a,i0,a,i0,a,i0)') &
++    &  ' OMP_NUM_THREADS=',n,' MKL_NUM_THREADS=',n,' OPENBLAS_NUM_THREADS=',n
++  end subroutine orca_omp_threads_string
++
++!========================================================================================!
++
++  subroutine write_orca_input(self,fname,mol,chrg,mult,nogr)
+     implicit none
+     class(orca_input),intent(in) :: self
+     character(len=*),intent(in) :: fname
+     type(coord),intent(in) :: mol
+     integer,intent(in) :: chrg
+     integer,intent(in) :: mult
++!>--- LOCAL EXTENSION: nogr = .true. writes the template WITHOUT the EnGrad
++!> keyword, i.e. turns it into a plain single point.  Used by ORCA_sp() when the
++!> caller (singlepoint(), i.e. the refine singlepoint re-ranking) only needs the
++!> energy: the gradient costs a CP-SCF/Z-vector solve (plus the CPCM gradient
++!> term) that nobody ever reads in that stage.
++!> OPTIONAL on purpose: every existing call site keeps the old behaviour.
++    logical,intent(in),optional :: nogr
+     integer :: ich,i,j,k,l
++    integer :: np
++    logical :: sponly
++    character(len=orca_linelen) :: line
+ 
+     if(.not.allocated(self%input))then
+       write (stderr,'(3a)') '**ERROR** Please provide an ORCA input template!'
+       error stop
+     endif
+ 
++    sponly = .false.
++    if (present(nogr)) sponly = nogr
++
++    np = orca_nprocs()
++
+     open (newunit=ich,file=fname)
+     do i=1,self%nlines
+-      write(ich,'(a)') trim(self%input(i))
++      line = self%input(i)
++      if (sponly.and.has_engrad(line)) line = strip_engrad(line)
++      write(ich,'(a)') trim(line)
+     enddo
++    !>--- MPI parallelisation.  Only injected when the template does not already
++    !> carry a %pal block (read_orca_input sets self%mpi when it sees one), so an
++    !> explicit %pal in orca.inp always wins.
++    if (np > 1 .and. .not.self%mpi) then
++      write(ich,'(a)') '%pal'
++      write(ich,'(a,1x,i0)') '  nprocs',np
++      write(ich,'(a)') 'end'
++    end if
+     write(ich,*)
+     write(ich,'(a,1x,i0,1x,i0,a)') '*xyz',chrg,mult,'  # charge and multiplicity (2S+1)'
+     do i=1,mol%nat
+diff --git a/src/calculator/turbom_sc.f90 b/src/calculator/turbom_sc.f90
+--- a/src/calculator/turbom_sc.f90
++++ b/src/calculator/turbom_sc.f90
+@@ -212,20 +212,22 @@
+     grad = 0.0_wp
+ 
+ !>--- read the energy file in TM format
+-    if (.not.allocated(calc%efile)) then
+-      if (allocated(calc%calcspace)) then
+-        calc%efile = trim(calc%calcspace)//sep//ef
+-      else
+-        calc%efile = ef
+-      end if
+-    end if
+-
+-    inquire (file=calc%efile,exist=ex)
++    !>--- same note as for gradfile below: only the NAME is kept, the path
++    !> prefix has to follow the CURRENT calcspace (per thread in parallel runs)
++    if (.not.allocated(calc%efile)) calc%efile = ef
++
++    if (allocated(calc%calcspace)) then
++      atmp = trim(calc%calcspace)//sep//trim(calc%efile)
++    else
++      atmp = trim(calc%efile)
++    end if
++
++    inquire (file=atmp,exist=ex)
+     if (.not.ex) then
+       iostatus = 1
+       return
+     end if
+-    open (newunit=ich,file=calc%efile)
++    open (newunit=ich,file=atmp)
+     call rd_energy_tm(ich,energy,iostatus)
+     close (ich)
+ 
+@@ -233,21 +235,27 @@
+ !>--- where we are only interested in the total energy. Hence, reading it can be skipped
+     if (calc%rdgrad) then
+ 
+-      if (.not.allocated(calc%gradfile)) then
+-        if (allocated(calc%calcspace)) then
+-          calc%gradfile = trim(calc%calcspace)//sep//gf
+-        else
+-          calc%gradfile = gf
+-        end if
++      !>--- NOTE: calc%gradfile only holds the file NAME (or a user supplied
++      !> name).  The path prefix has to be re-derived from the CURRENT
++      !> calc%calcspace on EVERY call - cp. generic_sc.f90.  Caching the full
++      !> path breaks parallel runs, where calcspace is switched per worker
++      !> thread (see parallel.f90): all workers would read the same stale
++      !> gradient file.  See the comment in xtb_sc.f90 for the full story.
++      if (.not.allocated(calc%gradfile)) calc%gradfile = gf
++
++      if (allocated(calc%calcspace)) then
++        atmp = trim(calc%calcspace)//sep//trim(calc%gradfile)
++      else
++        atmp = trim(calc%gradfile)
+       end if
+ 
+-      inquire (file=calc%gradfile,exist=ex)
++      inquire (file=atmp,exist=ex)
+       if (.not.ex) then
+         iostatus = 1
+         return
+       end if
+ 
+-      open (newunit=ich,file=calc%gradfile)
++      open (newunit=ich,file=atmp)
+       call rd_grad_tm(ich,mol%nat,energy,grad,iostatus)
+       close (ich)
+     end if

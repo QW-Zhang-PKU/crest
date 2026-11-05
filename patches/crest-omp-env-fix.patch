@@ -1,0 +1,484 @@
+# ===========================================================================
+# CREST 3.0.2 - child thread budget never reaches the external xtb process
+# ---------------------------------------------------------------------------
+# Symptom : in subprocess mode (TOML method="gfn", external xtb binary) a
+#           batch of 6 MTDs on 40 threads finishes in ~2m48s per MTD instead
+#           of the ~44 s CREST predicts; per-process CPU stays at 60-70 % and
+#           htop shows a lot of red (system/kernel) time.
+# Cause   : POSIX setenv(const char*, const char*, int) takes THREE arguments,
+#           but the iso_c_binding interface declared only two.  The
+#           "overwrite" flag was therefore read from an undefined register;
+#           whenever it happened to be 0, setenv() refused to update an
+#           ALREADY EXISTING variable.  crest_env.sh exports
+#           OMP_NUM_THREADS=40 / OPENBLAS_NUM_THREADS=1 / MKL_NUM_THREADS=1
+#           before CREST even starts, so ompenvset() could not lower
+#           OMP_NUM_THREADS to cores_per_job nor raise the BLAS budgets.
+#           Every xtb child then inherited OMP_NUM_THREADS=40 while its BLAS
+#           stayed single-threaded -> gross over-subscription of the OMP
+#           layer with a serialised BLAS layer underneath.
+# Fix     : declare the third argument and pass overwrite=1 at all three call
+#           sites (setenv_string / setenv_int / setenv_float).
+#           Additionally ompenvset() now also exports OMP_MAX_ACTIVE_LEVELS=1
+#           so that the child does not spawn "threads within threads" (xtb
+#           runs OpenMP loops and calls a threaded BLAS from them; with
+#           outer=inner=N this yields up to N*N runnable threads per job).
+#           That single line can be dropped to revert the extra guard.
+# Apply   : git apply -p1 crest-omp-env-fix.patch      (from the src/ parent)
+# ===========================================================================
+diff --git a/src/iomod.F90 b/src/iomod.F90
+--- a/src/iomod.F90
++++ b/src/iomod.F90
+@@ -35,10 +35,22 @@
+   end interface
+ 
+   interface
+-    integer(kind=c_int) function c_setenv(c_name,c_VALUE) bind(c,name="setenv")
++    !> NOTE: POSIX setenv() takes THREE arguments:
++    !>   int setenv(const char *name, const char *value, int overwrite);
++    !> The binding used to declare only two, so the "overwrite" flag was
++    !> read from an undefined register.  If that happened to be 0, setenv()
++    !> silently REFUSED to update an already existing variable.
++    !> Consequences: ompenvset() could not change OMP_NUM_THREADS /
++    !> MKL_NUM_THREADS / OPENBLAS_NUM_THREADS, so externally started
++    !> programs (xtb, orca, ... subprocesses) inherited whatever the
++    !> calling shell had exported - e.g. OPENBLAS_NUM_THREADS=1, which
++    !> serialises precisely the BLAS work that xtb parallelises with
++    !> OMP_NUM_THREADS.
++    integer(kind=c_int) function c_setenv(c_name,c_VALUE,c_overwrite) bind(c,name="setenv")
+       use iso_c_binding
+       character(kind=c_char)   :: c_name(*)
+       character(kind=c_char)   :: c_VALUE(*)
++      integer(kind=c_int),value :: c_overwrite
+     end function
+   end interface
+   interface setenv
+@@ -289,6 +301,16 @@
+ !-------------------------------------------------------------------------
+ ! append content of text file "from" into text file "to", similar to "cat A >> B"
+ !-------------------------------------------------------------------------
++!>--- LOCAL CHANGE (2026-09-27): open the target for APPENDING instead of
++!> emulating it with a read-to-EOF scan.  The old code did
++!>     open(newunit=ich,file=to)      ! position 0
++!>     do; read(ich,*,iostat=io); ...  ! walk to the end
++!> which re-read the WHOLE accumulated target on every call.  collectcre()
++!> (legacy_algos/confscript2_misc.f90) appends one .cre_* file per restart
++!> round through this routine, so merging R files cost O(R^2) reading - and on
++!> NFS every one of those passes is a network round trip.  POSITION='APPEND'
++!> (F2003, supported by gfortran and ifx) makes each append O(1).
++!-------------------------------------------------------------------------
+   subroutine appendto(from,to)
+     implicit none
+     integer :: ich,och
+@@ -297,15 +319,8 @@
+     character(len=*) :: from
+     character(len=*) :: to
+     character(len=1024) :: str
+-    open (newunit=ich,file=to)
++    open (newunit=ich,file=to,position='append')
+     open (newunit=och,file=from)
+-    do
+-      read (ich,*,iostat=io)
+-      if (io < 0) then
+-        backspace (ich)
+-        exit
+-      end if
+-    end do
+     do
+       read (och,'(a)',iostat=io) str
+       if (io < 0) then
+@@ -337,7 +352,7 @@
+     integer :: setenv_string
+     character(len=*) :: env
+     character(len=*) :: str
+-    setenv_string = c_setenv(env//c_null_char,str//c_null_char) !create new directory
++    setenv_string = c_setenv(env//c_null_char,str//c_null_char,1_c_int) !> 1 = overwrite existing value
+     return
+   end function setenv_string
+   function setenv_int(env,intval)
+@@ -347,7 +362,7 @@
+     integer :: intval
+     character(len=20) :: str
+     write (str,'(i0)') intval
+-    setenv_int = c_setenv(env//c_null_char,trim(str)//c_null_char) !create new directory
++    setenv_int = c_setenv(env//c_null_char,trim(str)//c_null_char,1_c_int) !> 1 = overwrite existing value
+     return
+   end function setenv_int
+   function setenv_float(env,floatval)
+@@ -357,7 +372,7 @@
+     real(wp) :: floatval
+     character(len=30) :: str
+     write (str,'(f14.6)') floatval
+-    setenv_float = c_setenv(env//c_null_char,trim(str)//c_null_char) !create new directory
++    setenv_float = c_setenv(env//c_null_char,trim(str)//c_null_char,1_c_int) !> 1 = overwrite existing value
+     return
+   end function setenv_float
+ 
+@@ -1171,16 +1186,242 @@
+ !> To circumvent issues for now, I will simply include two different wrappers with
+ !> precompiler statements.
+ !> It doesn't matter too much as these are mostly relevant for legacy routines.
++!>-----------------------------------------------------------------------------!
++!> Scratch root for the per-call calculation directories.
++!>
++!> CREST runs every single point inside its own directory "calculation.level.<n>"
++!> **below the current working directory**.  On a networked / spinning-disk
++!> workspace that turns every scratch write of the external program into a
++!> network round trip, which easily dominates the runtime of a cheap level of
++!> theory.  CREST_SCRATCH_DIR relocates those directories to node-local storage:
++!>
++!>     export CREST_SCRATCH_DIR=/tmp/crest-$SLURM_JOB_ID
++!>
++!> It is created with "mkdir -p": iomod%makedir() is a bare POSIX mkdir() and
++!> would NOT create the parents.  The result is returned WITHOUT a separator
++!> when unset and WITH exactly one trailing '/' when set, so callers can simply
++!> prepend it to the directory name.
++!>
++!> NOTE: the root must be unique per job - two concurrent CREST runs sharing
++!> one root would both use ".../calculation.level.1".
++!>-----------------------------------------------------------------------------!
++  subroutine crest_scratch_dir(dir)
++    implicit none
++    character(len=:),allocatable,intent(out) :: dir
++    character(len=512) :: val
++    integer :: l,io,estat
++    dir = ''
++    val = ''
++    !> F2003 standard intrinsic (getenv is only a vendor extension)
++    call get_environment_variable('CREST_SCRATCH_DIR',value=val,status=estat)
++    if (estat /= 0) return
++    if (len_trim(val) == 0) return
++    dir = trim(val)
++    l = len_trim(dir)
++    do while (l > 1 .and. dir(l:l) == '/')
++      dir = dir(1:l-1)
++      l = l-1
++    end do
++    !> "/" alone (or a string of nothing but slashes) would give the nonsense
++    !> path "//calculation.level.N" -> fall back to the default location.
++    if (len_trim(dir) == 0 .or. trim(dir) == '/') then
++      dir = ''
++      return
++    end if
++    dir = trim(dir)//'/'
++    call command('mkdir -p "'//trim(dir)//'"',io)
++    if (io /= 0) then
++      !> without this the later mkdir(calculation.level.N) fails as well and
++      !> the run dies with the unhelpful "Initial geometry optimization failed!"
++      write (stdout,'(1x,a,a)') '**WARNING** could not create CREST_SCRATCH_DIR: ',trim(dir)
++    end if
++  end subroutine crest_scratch_dir
++
++!>-----------------------------------------------------------------------------!
++!> Directory for the "cold" intermediate files: written only a handful of times
++!> per run, so they gain nothing from node-local storage - but they are of no
++!> interest to the user either, so they should not clutter the workspace.
++!>
++!>   export CREST_WORK_DIR=crest_work    # default
++!>   export CREST_WORK_DIR=none          # -> upstream layout, no relocation
++!>
++!> Same contract as crest_scratch_dir(): '' when disabled, otherwise "<name>/"
++!> with exactly one trailing '/'.
++!>-----------------------------------------------------------------------------!
++  subroutine crest_work_dir(dir)
++    implicit none
++    character(len=:),allocatable,intent(out) :: dir
++    character(len=512) :: val
++    integer :: l,io,estat
++    dir = ''
++    val = ''
++    call get_environment_variable('CREST_WORK_DIR',value=val,status=estat)
++    if (estat /= 0 .or. len_trim(val) == 0) val = 'crest_work'
++    if (trim(val) == 'none' .or. trim(val) == '0') return
++    dir = trim(val)
++    l = len_trim(dir)
++    do while (l > 1 .and. dir(l:l) == '/')
++      dir = dir(1:l-1)
++      l = l-1
++    end do
++    if (len_trim(dir) == 0 .or. trim(dir) == '/') then
++      dir = ''
++      return
++    end if
++    dir = trim(dir)//'/'
++    call command('mkdir -p "'//trim(dir)//'"',io)
++    if (io /= 0) then
++      write (stdout,'(1x,a,a)') '**WARNING** could not create CREST_WORK_DIR: ',trim(dir)
++      dir = ''
++    end if
++  end subroutine crest_work_dir
++
++!>-----------------------------------------------------------------------------!
++!> Relocate CREST's intermediate files out of the workspace.
++!>
++!> Two classes, matching how often they are touched:
++!>   HOT  -> CREST_SCRATCH_DIR (node-local): trajectories, restart dumps, ...
++!>   COLD -> CREST_WORK_DIR (subdirectory of the workspace): coord, wbo, ...
++!> The user-facing results (crest_conformers.xyz, crest_rotamers.xyz, the
++!> ensemble files, ...) are NOT touched and stay where they are.
++!>
++!> IMPLEMENTATION: symbolic links, not code changes at the open() sites.
++!> CREST hard-codes these names in dozens of places ("coord" alone appears ~50
++!> times), so rewriting every call site would be a large and unsafe change.
++!> A link "coord -> <target>/coord" makes the existing open(file='coord') write
++!> to the target while every reader stays untouched.  The decisive advantage is
++!> that the failure mode is benign: if a name is missing from the tables below,
++!> or if CREST removes a link, the file simply ends up in the workspace again -
++!> the run stays correct, it just loses the speed-up / tidiness.
++!>
++!>   export CREST_STAGE_FILES=0   # escape hatch: disable all of this
++!>-----------------------------------------------------------------------------!
++  subroutine crest_stage_files()
++    implicit none
++    character(len=:),allocatable :: hot,work
++    character(len=512) :: val
++    integer :: i,estat,nhot,ncold
++    !>--- written every few MD steps -> node-local scratch
++!>--- LOCAL CHANGE (2026-09-27): the list used to hold all five temp directory
++!> names CREST has ever used (MDFILES, METADYN, NORMMD, MRMSD, OPTIM - see the
++!> array literal removed here), created eagerly at start-up regardless of the
++!> run type.  Three of them could never do anything:
++!>   MRMSD   - has NO writer left anywhere in this tree.  The only other
++!>             occurrence is cleanup.f90's rmrf('MRMSD'), i.e. a leftover from
++!>             an older version that removed the directory it no longer fills.
++!>   METADYN - the legacy V2 code names its directories METADYN<i>
++!>   NORMMD    (confscript2_misc.f90:361 and normmd.f90:233 both do
++!>             `write(tmppath,'(a,i0)') 'METADYN',vz`, and set_trj_origins()
++!>             appends the same index), and it creates them itself via
++!>             `rmrf(tmppath)` + `makedir(trim(tmppath))`
++!>             (confscript2_misc.f90:266-267, normmd.f90:48-49).
++!>             A symlink of the BARE name can therefore never be matched.
++!> What is kept, and why:
++!>   MDFILES - the modern MD/MTD worker trajectories (parallel.f90:1269,
++!>             `mddats(i)%trajectoryfile = mdir//sep//...`).  It is additionally
++!>             relocated by PATH via crest_hot_dir(), which does not depend on
++!>             this symlink at all.
++!>   OPTIM   - the legacy optimisation directory, genuinely written by
++!>             confopt.f90:316 / confscript2_misc.f90:453 / reactor.f90:695 and
++!>             the -protonate / -tautomerize / -deprotonate run types
++!>             (rename('OPTIM/opt.xyz',...)).
++!> Removing the three dead names is behaviour-neutral: nothing ever wrote into
++!> them, so the run is identical, there are just three fewer empty directories
++!> plus symlinks in the workspace and the scratch root.
++    character(len=32),parameter :: hotl(2) = [character(len=32) :: &
++    &   'MDFILES','OPTIM']
++    !>--- written a few times per run -> subdirectory of the workspace
++    character(len=32),parameter :: coldl(7) = [character(len=32) :: &
++    &   'coord','wbo','crestopt.xyz','gfnff_adjacency','gfnff_topo', &
++    &   '.CHRG','.UHF']
++
++    call get_environment_variable('CREST_STAGE_FILES',value=val,status=estat)
++    if (estat == 0) then
++      if (trim(val) == '0' .or. trim(val) == 'none') return
++    end if
++
++    call crest_scratch_dir(hot)
++    call crest_work_dir(work)
++    if (len(hot) == 0 .and. len(work) == 0) return
++
++    nhot = size(hotl)
++    ncold = size(coldl)
++    do i = 1,nhot
++      if (len(hot) > 0) call crest_link(hot,trim(hotl(i)),.true.)
++    end do
++    do i = 1,ncold
++      if (len(work) > 0) call crest_link(work,trim(coldl(i)),.false.)
++    end do
++  end subroutine crest_stage_files
++
++!>-----------------------------------------------------------------------------!
++!> Put the symlink "name -> <root><name>" in the working directory.
++!> "isdir" also creates the target directory itself.
++!> Anything that already exists is left strictly alone.
++!>-----------------------------------------------------------------------------!
++  subroutine crest_link(root,name,isdir)
++    implicit none
++    character(len=*),intent(in) :: root
++    character(len=*),intent(in) :: name
++    logical,intent(in) :: isdir
++    character(len=1024) :: cmd
++    integer :: io
++    logical :: ex
++
++    inquire (file=trim(name),exist=ex)
++    if (ex) return
++    if (isdir) then
++      call command('mkdir -p "'//trim(root)//trim(name)//'"',io)
++      if (io /= 0) return
++    else
++      call command('mkdir -p "'//trim(root)//'"',io)
++      if (io /= 0) return
++    end if
++    !> a dangling link from an earlier run is not "existing" for inquire(), so
++    !> remove whatever is there first - never a real file, that was caught above
++    cmd = 'rm -f "'//trim(name)//'" ; ln -s "'// &
++    &     trim(root)//trim(name)//'" "'//trim(name)//'"'
++    call command(trim(cmd),io)
++  end subroutine crest_link
++
++!>-----------------------------------------------------------------------------!
++!> Hot variant of a scratch subdirectory: "<CREST_SCRATCH_DIR><name>"
++!> (or just <name> when no scratch directory is configured).
++!>-----------------------------------------------------------------------------!
++  subroutine crest_hot_dir(dir,name)
++    implicit none
++    character(len=:),allocatable,intent(out) :: dir
++    character(len=*),intent(in) :: name
++    character(len=:),allocatable :: root
++    call crest_scratch_dir(root)
++    dir = trim(root)//trim(name)
++  end subroutine crest_hot_dir
++
++!>-----------------------------------------------------------------------------!
+   subroutine command(cmd,exitstat)
+     implicit none
+     character(len=*),intent(in) :: cmd
+     integer,intent(out),optional :: exitstat
+     integer :: io
+-#ifdef __INTEL_COMPILER
+-    call execute_command_line(trim(cmd),exitstat=io)
+-#else
+-    call system(trim(cmd),io)
+-#endif
++    interface
++      !> SIGINT-safe system(): see src/signal.c.  The Fortran SYSTEM intrinsic
++      !> and EXECUTE_COMMAND_LINE both end up in POSIX system(3), which is
++      !> REQUIRED to ignore SIGINT and SIGQUIT while it waits for the child.
++      !> CREST is inside this routine for ~100 % of its run time (waiting for
++      !> orca/xtb), so with system(3) Ctrl+C could never terminate CREST -
++      !> it only killed the child and CREST sat in waitpid() forever.
++      !> crest_runcmd() is fork()+execl("/bin/sh","sh","-c",cmd)+waitpid()
++      !> and leaves the signal dispositions alone.
++      function crest_runcmd(ccmd) bind(C,name="crest_runcmd") result(stat)
++        use iso_c_binding
++        character(kind=c_char),dimension(*),intent(in) :: ccmd
++        integer(c_int) :: stat
++      end function crest_runcmd
++    end interface
++    !> the external program reads files that were just written: make sure the
++    !> console is not still holding a partially filled buffer
++    flush (stdout)
++    io = crest_runcmd(trim(cmd)//c_null_char)
+     if (present(exitstat)) exitstat = io
+   end subroutine command
+ 
+diff --git a/src/ompmklset.F90 b/src/ompmklset.F90
+--- a/src/ompmklset.F90
++++ b/src/ompmklset.F90
+@@ -55,7 +55,22 @@
+ 
+   io = setenv('OMP_NUM_THREADS',omp)
+   io = setenv('MKL_NUM_THREADS',omp)
+-  io = setenv('OPENBLAS_NUM_THREADS',omp) 
++  io = setenv('OPENBLAS_NUM_THREADS',omp)
++  !>--- NOTE: this routine prepares the environment for an EXTERNAL program
++  !> (xtb, orca, ...).  Those programs parallelise in more than one way: xtb
++  !> runs OpenMP loops *and* calls a threaded BLAS from them, i.e. it literally
++  !> spawns "threads within threads".  With an outer budget of N and an inner
++  !> budget of N the child can end up with N*N runnable threads per job, which
++  !> over-subscribes the machine and shows up as low per-process CPU together
++  !> with a large amount of system (red) time.
++  !> Setting OMP_MAX_ACTIVE_LEVELS=1 deactivates the nested OpenMP level, so
++  !> the outer N threads remain the only OpenMP layer.  This is exactly what
++  !> the xtb manual recommends for parallel runs:
++  !>   export OMP_NUM_THREADS=...   OMP_MAX_ACTIVE_LEVELS=1
++  !> It only affects child processes - CREST configures its own runtime with
++  !> omp_set_max_active_levels()/OMP_Set_Num_Threads() in new_ompautoset().
++  !> Remove this one line to revert to the plain behaviour.
++  io = setenv('OMP_MAX_ACTIVE_LEVELS',1)
+ 
+ end subroutine ompenvset
+ 
+@@ -73,7 +88,25 @@
+   integer,intent(in)  :: maxjobs
+   integer,intent(out) :: parallel_jobs
+   integer,intent(out) :: cores_per_job
++  !> NOTE: this is an EXTERNAL procedure (no module, no explicit interface at
++  !> any of the ~50 call sites).  An OPTIONAL dummy argument is therefore
++  !> undefined behaviour here: callers that pass only five arguments leave the
++  !> sixth slot filled with garbage, present() can then report .true. for an
++  !> argument that was never passed, and the dereference segfaults.
++  !> Any behavioural switch must be encoded in the "modus" string instead:
++  !>   'auto'        -> distribute the threads, but do NOT open a nested team
++  !>   'auto_nested' -> distribute the threads and allow a nested team
++  !>   'fixed'       -> CREST_CORES_PER_JOB cores per job (default 4), run
++  !>                    T/cores_per_job jobs at a time, the rest queue
++  !> 'auto_nested' may only be used when cores_per_job is consumed inside CREST.
++  !> If cores_per_job is handed to an external program via OMP_NUM_THREADS
++  !> (xtb, orca, ... subprocesses) 'auto' has to be used, because the CREST
++  !> thread blocks anyway and a nested team would book the budget twice.
++  !> 'fixed' is for batch loops over an ensemble that is larger than the core
++  !> count, where 'auto' would degenerate to one core per job.
+   integer :: T,Tdiff
++  integer :: r
++  character(len=64) :: val
+   real(wp) :: Tfrac,Tfloor
+ 
+   !> The default, all threads allocated to CREST
+@@ -94,6 +127,10 @@
+       Tfloor = floor(Tfrac)
+       cores_per_job = max(nint(Tfloor),1)
+     end if
++    !> never ask for more cores in total than there are threads available
++    if (parallel_jobs*cores_per_job > T) then
++      cores_per_job = max(1,T/parallel_jobs)
++    end if
+     if (index(modus,'_nested') .ne. 0 .and. cores_per_job > 1) then
+       if (env%omp_allow_nested) then
+         !> We should never need more than two active nested layers
+@@ -104,6 +141,56 @@
+       !call mkl_free_buffers()
+       call mkl_set_dynamic(0)
+ #endif
++    end if
++    call openblasset(1)
++
++  case ('fixed')
++    !>---------------------------------------------------------------------
++    !> Give every job a FIXED number of cores and run as many jobs at once as
++    !> fit into the budget; the OpenMP task queue keeps the remaining jobs
++    !> waiting, so nothing oversubscribes the machine:
++    !>     cores_per_job = CREST_CORES_PER_JOB   (default 4)
++    !>     parallel_jobs = T / cores_per_job
++    !>
++    !> This is what an MPI-parallel external program (ORCA) needs.  The generic
++    !> 'auto' scheme distributes T over "maxjobs" instead, which for a real
++    !> conformer ensemble (nall >> T) means T jobs with ONE core each - an ORCA
++    !> gradient on one core, hundreds of times over.  Reserving 4 cores per job
++    !> and running T/4 of them is far faster and is exactly what the user asked
++    !> for: "N jobs in parallel, the rest queue".
++    !>
++    !> If there are FEWER structures than T/cores_per_job, the leftover cores
++    !> are handed to the jobs that do exist (so a 2-structure ensemble on 40
++    !> cores still gets 20 cores per job instead of 4).
++    !>---------------------------------------------------------------------
++    call getenv('CREST_CORES_PER_JOB',val)
++    read (val,*,iostat=r) cores_per_job
++    if (r /= 0) cores_per_job = 4
++    cores_per_job = max(1,min(cores_per_job,T))
++    if (maxjobs > 0.and.T > maxjobs) then
++      cores_per_job = max(cores_per_job,T/maxjobs)
++    end if
++    cores_per_job = max(1,min(cores_per_job,T))
++    parallel_jobs = max(1,T/cores_per_job)
++    call openblasset(1)
++
++  case ('share')
++    !>---------------------------------------------------------------------
++    !> Run ONE job, but hand it exactly the core budget a single job gets in
++    !> the parallel phase (T/maxjobs).  Used by the trial MTD: measuring with
++    !> the real per-job budget makes both the trial AND the runtime estimate
++    !> derived from it representative.
++    !>
++    !> Upstream used 'min' here (one core) "to simulate max parallelization".
++    !> That made every trial MTD needlessly slow and forced the estimator to
++    !> *assume* a perfect speed-up of floor(T/nmetadyn) afterwards, which is
++    !> where wildly optimistic predictions came from.
++    !>---------------------------------------------------------------------
++    parallel_jobs = 1
++    if (maxjobs > 0) then
++      cores_per_job = max(1,T/maxjobs)
++    else
++      cores_per_job = max(1,T)
+     end if
+     call openblasset(1)
+ 

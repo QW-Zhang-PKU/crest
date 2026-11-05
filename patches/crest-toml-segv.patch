@@ -1,0 +1,48 @@
+diff --git a/src/parsing/parse_calcdata.f90 b/src/parsing/parse_calcdata.f90
+--- a/src/parsing/parse_calcdata.f90
++++ b/src/parsing/parse_calcdata.f90
+@@ -89,8 +89,21 @@
+ 
+     included = .false.
+     call calc%reset()
+-    call env%ref%to(moltmp)
+-    call axis(moltmp%nat,moltmp%at,moltmp%xyz)
++    !>--- SAFETY GUARD
++    !> env%ref stores the REFERENCE structure and is only filled once the
++    !> input coordinates have actually been read.  This routine, however,
++    !> is also called while the input file (TOML) is being parsed, which
++    !> happens BEFORE the coordinates are read (see parseflags in
++    !> confparse.f90).  At that point env%ref%nat is undefined and
++    !> env%ref%at / env%ref%xyz are not allocated.  Passing them on to
++    !> axis() dereferences invalid memory and aborts with a SIGSEGV.
++    !> Therefore the reference-dependent orientation is only performed
++    !> when a valid reference structure is available.
++    moltmp%nat = 0
++    if (allocated(env%ref%at).and.allocated(env%ref%xyz)) then
++      call env%ref%to(moltmp)
++      call axis(moltmp%nat,moltmp%at,moltmp%xyz)
++    end if
+ 
+     do i = 1,dict%nblk
+       call blk%deallocate()
+@@ -133,6 +146,20 @@
+       end if
+     end do
+     if (included) then
++      !>--- the calculation setup was read but the reference structure was
++      !> not available at this point. This is fine for plain level
++      !> settings, but anything that refers to individual atoms
++      !> (atom lists, constraints, ...) will not be resolved correctly.
++      if (.not.allocated(env%ref%at)) then
++        write (stdout,'(1x,a)') &
++        & 'NOTE: no reference structure available while reading the calculation setup.'
++        write (stdout,'(1x,a)') &
++        & '      If your input uses atom lists or constraints, add a line'
++        write (stdout,'(1x,a)') &
++        & '      input = "yourcoordinatefile.xyz" to your input file, so that the'
++        write (stdout,'(1x,a)') &
++        & '      coordinates are read before the calculation block is parsed.'
++      end if
+       call calc%init()
+     end if
+     return

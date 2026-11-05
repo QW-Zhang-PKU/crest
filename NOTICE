@@ -1,0 +1,56 @@
+CREST 3.0.2 — YuGroup local fork / 本地修改版
+
+Copyright and attribution
+-------------------------
+CREST is developed by the CREST developers and is distributed under the
+GNU Lesser General Public License, version 3 (LGPL-3.0-or-later).
+Upstream project: https://github.com/crest-lab/crest
+Upstream citation: see CITATION.cff and README.md.
+
+This source snapshot is a locally modified CREST 3.0.2 tree prepared for
+the YuGroup cluster at Peking University. It is based on the pristine
+CREST 3.0.2 source archive identified in LOCAL-CHANGES.md.
+
+Local modifications
+-------------------
+The local modifications are released under the same LGPL-3.0-or-later
+terms as the upstream work. A machine-readable inventory of the modified
+and added files is provided in CHANGED-FILES.txt; the human-readable
+change description is in LOCAL-CHANGES.md.
+
+When redistributing a modified version, retain:
+  - COPYING (GNU GPL v3)
+  - COPYING.LESSER (GNU LGPL v3)
+  - LICENSE (LGPL v3 text)
+  - this NOTICE
+  - the upstream copyright/license notices in the source files
+  - the license files of the vendored subprojects under subprojects/
+
+Vendored third-party components
+-------------------------------
+The complete sources of the following subprojects are vendored under
+subprojects/ for offline builds. Each component retains its own license
+in its own directory:
+
+  tblite       LGPL-3.0 (COPYING, COPYING.LESSER)
+  gfn0         LGPL-3.0 (COPYING, COPYING.LESSER)
+  gfnff        LGPL-3.0 (COPYING, COPYING.LESSER)
+  lwoniom      LGPL-3.0 (COPYING, COPYING.LESSER)
+  pvol         LGPL-3.0 (COPYING, COPYING.LESSER)
+  toml-f       MIT / Apache-2.0 (LICENSE-MIT, LICENSE-Apache)
+  test-drive   MIT / Apache-2.0 (LICENSE-MIT, LICENSE-Apache)
+
+Provenance note for src/signal.c
+--------------------------------
+The original CREST file src/signal.c carries the historical header
+"taken from the internet" and did not include a per-file license header.
+It is included here because it is part of the upstream CREST 3.0.2 source
+used by this fork. The local additions in that file are released under
+LGPL-3.0-or-later. For a formal legal review, confirm the provenance of
+the original pre-CREST snippet with the upstream maintainers before
+publishing a binary distribution.
+
+No warranty
+-----------
+This software is provided "as is", without warranty of any kind, to the
+extent permitted by applicable law. See COPYING and COPYING.LESSER.

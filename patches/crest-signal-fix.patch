@@ -1,0 +1,433 @@
+# ===========================================================================
+# CREST 3.0.2 - Ctrl+C (and kill) cannot stop CREST
+# ---------------------------------------------------------------------------
+# Symptom : CREST ignores Ctrl+C while it runs an external program.  The
+#           terminal looks frozen; the only way out is kill -9 from a
+#           second shell.  `Ctrl+\` (SIGQUIT) and pkill -f crest are just
+#           as ineffective.
+# Cause   : two independent bugs that reinforce each other
+#   1) iomod:command() used the Fortran SYSTEM intrinsic resp.
+#      EXECUTE_COMMAND_LINE.  Both end up in POSIX system(3), which is
+#      REQUIRED to ignore SIGINT and SIGQUIT and to block SIGCHLD while
+#      it waits for the child.  CREST is inside command() for ~100 % of
+#      its run time, so the signal never got through.  (Check with
+#      `grep SigIgn /proc/$PID/status`: bit 0x2 = SIGINT is ignored.)
+#   2) the handlers in sigterm.f90 were NOT async-signal-safe: write(*,*),
+#      cs_shutdown() and exit() all take locks (Fortran I/O lock,
+#      allocator).  With OpenMP the signal is delivered to an ARBITRARY
+#      thread, so the handler regularly deadlocked on a lock another
+#      thread was holding.  signal(9,...) and signal(69,...) were no-ops
+#      (SIGKILL is uncatchable, 69 is not a Linux signal).
+# Fix     : 1) src/signal.c now provides crest_runcmd(): fork() +
+#             execl("/bin/sh","sh","-c",cmd) + waitpid(), with the signal
+#             dispositions left alone.  The child is put into its own
+#             process group, so the whole job (the "sh -c" wrapper AND the
+#             orca/xtb process it spawns) can be killed at once.
+#          2) crest_install_signals() installs one async-signal-safe C
+#             handler for SIGINT/SIGQUIT/SIGTERM/SIGHUP/SIGXCPU that only
+#             uses write(2) -> kill(child process groups) -> _exit(128+sig).
+#             An inherited SIG_IGN is never overridden (so `nohup crest`
+#             keeps working).
+# NOTE    : the caller-side half of the fix is in src/iomod.F90
+#           (command() => crest_runcmd()) and ships in
+#           crest-omp-env-fix.patch.  Apply the aggregate
+#           crest-threadfix.patch if you want everything in one go.
+# Apply   : git apply -p1 crest-signal-fix.patch    (from the src/ parent)
+# ===========================================================================
+diff --git a/src/signal.c b/src/signal.c
+--- a/src/signal.c
++++ b/src/signal.c
+@@ -7,6 +7,14 @@
+  *  code but actually impossible to do with FORTRAN only.
+  */
+ #include <signal.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++#include <sys/types.h>
++#include <sys/wait.h>
+ 
+ typedef void (*sighandler_t)(int);
+ 
+@@ -14,3 +22,268 @@
+ {
+    signal(*signum, handler);
+ }
++
++/* =========================================================================
++ *  CREST local fix: make Ctrl+C (and kill) actually stop CREST.
++ *
++ *  ------------------------------------------------------------------
++ *  What was wrong
++ *  ------------------------------------------------------------------
++ *  CREST spends almost 100 % of its run time inside
++ *  iomod:command(), waiting for an external program (orca/xtb/...).
++ *  command() used the Fortran SYSTEM intrinsic resp.
++ *  EXECUTE_COMMAND_LINE, and both end up in POSIX system(3).
++ *  system(3) is REQUIRED to
++ *     - ignore SIGINT and SIGQUIT in the parent, and
++ *     - block SIGCHLD
++ *  while it waits for the child (see `man 7 signal` / POSIX 2008, and the
++ *  RATIONALE section of system(): "...the user expects the application to
++ *  be killed, but only the command is killed").
++ *  Consequence: Ctrl+C killed orca but left CREST sitting in waitpid();
++ *  the terminal looked frozen and the only way out was kill -9 from a
++ *  second shell.  Verifiable with
++ *     grep SigIgn /proc/$PID/status      # bit 0x2 (SIGINT) set
++ *
++ *  ------------------------------------------------------------------
++ *  The fix
++ *  ------------------------------------------------------------------
++ *  1) crest_runcmd() is a hand-rolled fork()+execl("/bin/sh","sh","-c",cmd)
++ *     + waitpid() that leaves the signal dispositions ALONE.  The child is
++ *     put into its own process group (setpgid) so that the whole job (the
++ *     "sh -c" wrapper AND everything it spawns - remember the system call is
++ *     'cd <dir> && orca ORCA.in > ORCA.out') can be signalled at once.
++ *
++ *  2) crest_install_signals() installs ONE async-signal-safe C handler for
++ *     SIGINT/SIGQUIT/SIGTERM/SIGHUP/SIGXCPU.  It only uses write(2), kill()
++ *     and _exit().  The old Fortran handlers (wsigint/wsigquit/wsigterm in
++ *     sigterm.f90) called write(*,*), cs_shutdown() and exit() - none of
++ *     which may be called from a signal handler.  With OpenMP the signal is
++ *     delivered to an ARBITRARY thread; if that thread is not the one
++ *     holding the Fortran I/O lock, write(*,*) deadlocks - which is exactly
++ *     the second half of the "CREST hangs on Ctrl+C" story.
++ *
++ *  Both halves are needed: without (1) the signal never gets through, and
++ *  without (2) the process deadlocks or corrupts its heap while it dies.
++ *
++ *  Compile-time note: no feature-test macros are defined here on purpose -
++ *  the glibc/Intel defaults already expose everything, and defining
++ *  _POSIX_C_SOURCE would hide sighandler_t on some toolchains.
++ * ========================================================================= */
++
++/* How many external programs may be waited for at the same time.  CREST runs
++   at most one per OpenMP thread; 64 is far beyond any realistic node. */
++#define CREST_MAX_CHILDREN 64
++
++struct crest_child {
++  volatile sig_atomic_t pid;   /* 0 == slot free                          */
++  volatile sig_atomic_t pgrp; /* process group id, 0 == not a pgrp leader */
++};
++
++static struct crest_child crest_children[CREST_MAX_CHILDREN];
++static volatile sig_atomic_t crest_signals_up = 0;
++
++/* ------------------------------------------------------------------ */
++/*  Async-signal-safe handler: write(2) -> kill() -> _exit().         */
++/* ------------------------------------------------------------------ */
++static void crest_sighandler(int sig)
++{
++  static const char msg[] =
++    "\nCREST: termination signal caught - stopping external programs.\n";
++  struct timespec ts;
++  int i, pass;
++  pid_t p, q;
++
++  (void)!write (2, msg, sizeof(msg) - 1);
++
++  /* pass 0 = polite (SIGTERM), pass 1 = certain (SIGKILL). */
++  for (pass = 0; pass < 2; pass++) {
++    int s = (pass == 0) ? SIGTERM : SIGKILL;
++    for (i = 0; i < CREST_MAX_CHILDREN; i++) {
++      p = (pid_t)crest_children[i].pgrp;
++      q = (pid_t)crest_children[i].pid;
++      if (p > 0) {
++        if (kill (-p, s) < 0 && errno == ESRCH && q > 0)
++          (void)kill (q, s);
++      } else if (q > 0) {
++        (void)kill (q, s);
++      }
++    }
++    if (pass == 0) {
++      /* give orca/xtb a moment to unlink their scratch files */
++      ts.tv_sec = 0;
++      ts.tv_nsec = 250000000L;   /* 0.25 s */
++      (void)nanosleep (&ts, NULL);
++    }
++  }
++
++  _exit (128 + sig);
++}
++
++/* ------------------------------------------------------------------ */
++/*  Install the handler for every signal that must stop CREST.        */
++/* ------------------------------------------------------------------ */
++void crest_install_signals(void)
++{
++  struct sigaction sa, old;
++  int sigs[5];
++  int i, n;
++
++  if (crest_signals_up)
++    return;
++
++  memset (&sa, 0, sizeof(sa));
++  sa.sa_handler = crest_sighandler;
++  /* no SA_RESTART: we want blocking calls (waitpid) to fail with EINTR */
++  sa.sa_flags = 0;
++  sigemptyset (&sa.sa_mask);
++  sigaddset (&sa.sa_mask, SIGHUP);
++  sigaddset (&sa.sa_mask, SIGINT);
++  sigaddset (&sa.sa_mask, SIGQUIT);
++  sigaddset (&sa.sa_mask, SIGTERM);
++#ifdef SIGXCPU
++  sigaddset (&sa.sa_mask, SIGXCPU);
++#endif
++
++  n = 0;
++  sigs[n++] = SIGHUP;
++  sigs[n++] = SIGINT;
++  sigs[n++] = SIGQUIT;
++  sigs[n++] = SIGTERM;
++#ifdef SIGXCPU
++  sigs[n++] = SIGXCPU;   /* SLURM's "you are about to hit the time limit" */
++#endif
++  while (n < 5)
++    sigs[n++] = 0;
++
++  for (i = 0; i < 5; i++) {
++    if (sigs[i] == 0)
++      continue;
++    /* Never override an inherited SIG_IGN: `nohup crest ...` relies on
++       SIGHUP being ignored, and shells may hand us SIGQUIT ignored too. */
++    if (sigaction (sigs[i], (struct sigaction *)0, &old) == 0 &&
++        old.sa_handler == SIG_IGN)
++      continue;
++    (void)sigaction (sigs[i], &sa, (struct sigaction *)0);
++  }
++
++  crest_signals_up = 1;
++}
++
++/* ------------------------------------------------------------------ */
++/*  Claim a bookkeeping slot for a freshly forked child.              */
++/* ------------------------------------------------------------------ */
++static int crest_claim_slot(pid_t pid)
++{
++  unsigned long start = (unsigned long)pid % (unsigned long)CREST_MAX_CHILDREN;
++  int i;
++  for (i = 0; i < CREST_MAX_CHILDREN; i++) {
++    int s = (int)((start + (unsigned long)i) % (unsigned long)CREST_MAX_CHILDREN);
++    if (__sync_bool_compare_and_swap (&crest_children[s].pid,
++                                      (sig_atomic_t)0, (sig_atomic_t)pid)) {
++      crest_children[s].pgrp = 0;
++      return s;
++    }
++  }
++  return -1;
++}
++
++/* ------------------------------------------------------------------ */
++/*  system(3) without the SIGINT/SIGQUIT blindness.                   */
++/*  Returns the raw wait status (exactly like system(): 0 on success, */
++/*  exit_code<<8 when the command failed, -1 when fork() failed).     */
++/* ------------------------------------------------------------------ */
++int crest_runcmd(const char *cmd)
++{
++  int fds[2];
++  pid_t pid;
++  int status, slot;
++  unsigned char grpok;
++  ssize_t n;
++
++  if (cmd == (const char *)0)
++    return -1;
++
++  /* A one-byte pipe tells the parent whether the child managed to create
++     its own process group BEFORE it execs.  Both ends are closed in the
++     child right after the write, so the parent's read() can never hang. */
++  grpok = 0;
++  fds[0] = fds[1] = -1;
++  if (pipe (fds) != 0)
++    fds[0] = fds[1] = -1;
++
++  /* flush C stdio before the address space is duplicated */
++  fflush ((FILE *)0);
++
++  pid = fork ();
++  if (pid < 0) {
++    if (fds[0] >= 0) (void)close (fds[0]);
++    if (fds[1] >= 0) (void)close (fds[1]);
++    return -1;
++  }
++
++  if (pid == 0) {
++    /* ---- child: only async-signal-safe calls until execve() ---- */
++    int fd0;
++    unsigned char ok = 0;
++
++    /* own process group -> the handler can kill the whole job at once */
++    if (setpgid (0, 0) == 0)
++      ok = 1;
++
++    if (fds[1] >= 0) {
++      ssize_t w = write (fds[1], &ok, 1);
++      (void)w;
++      (void)close (fds[1]);
++    }
++    if (fds[0] >= 0)
++      (void)close (fds[0]);
++
++    /* stdin from /dev/null: the child is in a background process group now,
++       a read from the terminal would raise SIGTTIN and stall it. */
++    fd0 = open ("/dev/null", O_RDONLY);
++    if (fd0 >= 0) {
++      (void)dup2 (fd0, STDIN_FILENO);
++      if (fd0 > 2)
++        (void)close (fd0);
++    }
++
++    execl ("/bin/sh", "sh", "-c", cmd, (char *)0);
++    _exit (127);
++  }
++
++  /* ---- parent ---- */
++  if (fds[1] >= 0)
++    (void)close (fds[1]);
++  if (fds[0] >= 0) {
++    do {
++      n = read (fds[0], &grpok, 1);
++    } while (n < 0 && errno == EINTR);
++    if (n != 1)
++      grpok = 0;
++    (void)close (fds[0]);
++  }
++
++  slot = crest_claim_slot (pid);
++  if (slot >= 0 && grpok)
++    crest_children[slot].pgrp = (sig_atomic_t)pid;
++
++  status = 0;
++  for (;;) {
++    pid_t w = waitpid (pid, &status, 0);
++    if (w == pid)
++      break;
++    if (w < 0) {
++      if (errno == EINTR)   /* some unrelated signal: keep waiting */
++        continue;
++      status = -1;
++      break;
++    }
++  }
++
++  if (slot >= 0) {
++    crest_children[slot].pgrp = 0;
++    crest_children[slot].pid = 0;
++  }
++
++  return status;
++}
+diff --git a/src/sigterm.f90 b/src/sigterm.f90
+--- a/src/sigterm.f90
++++ b/src/sigterm.f90
+@@ -43,6 +43,11 @@
+   case ( status_safety )
+     write (stdout,*) 'Safety termination of CREST.'
+   end select
++!>--- LOCAL EXTENSION: exit(3) does NOT reliably flush the Fortran runtime
++!> I/O buffers. Without this the terminating message above (and everything
++!> printed shortly before it) can be missing from a redirected crest.out,
++!> which is what makes the log look "written but never finished".
++  flush (stdout)
+   call exit(io)
+ 
+ end subroutine creststop
+@@ -51,66 +56,35 @@
+ !CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC!
+ !================================================================================!
+ 
+-subroutine wsigint !> Ctrl+C
+-  use crest_parameters,only:stderr,stdout
+-  use crest_restartlog,only:dump_restart
+-  use ConfSolv_module
+-  integer :: myunit,io
+-  write (*,*)
+-  write (stderr,'(" recieved SIGINT, trying to terminate CREST...")')
+-  !call dump_restart()
+-  call cs_shutdown(io)
+-  call exit(130)
+-  error stop
+-end subroutine wsigint
++!> NOTE: the handlers for SIGINT/SIGQUIT/SIGTERM/SIGHUP/SIGXCPU live in
++!> src/signal.c (crest_sighandler / crest_install_signals), NOT here.
++!> They used to be the Fortran routines wsigint/wsigquit/wsigterm below, but
++!> those are NOT async-signal-safe: write(*,*), cs_shutdown() and exit() all
++!> take locks (the Fortran I/O lock, the allocator lock) that some OTHER
++!> thread may already hold when the signal is delivered. With OpenMP the
++!> signal goes to an arbitrary thread, so this deadlocked regularly - that
++!> was half of the "CREST cannot be stopped with Ctrl+C" problem.
++!> The C handler only does write(2) -> kill(child process groups) -> _exit(),
++!> all three of which are guaranteed async-signal-safe.
++subroutine initsignal()
++  implicit none
++  logical,save :: signalset = .false.
++  interface
++    subroutine crest_install_signals() bind(C,name="crest_install_signals")
++    end subroutine crest_install_signals
++  end interface
+ 
+-subroutine wsigquit !> Ctrl+D or Ctrl+\
+-  use crest_parameters,only:stderr,stdout
+-  use crest_restartlog,only:dump_restart
+-  use ConfSolv_module
+-  integer :: myunit,io
+-  write (*,*)
+-  write (stderr,'(" recieved SIGQUIT, trying to terminate CREST...")')
+-  !call dump_restart()
+-  call cs_shutdown(io)
+-  call exit(131)
+-  error stop
+-end subroutine wsigquit
++  !> signal dispositions are process-wide and (BSD/Linux semantics) stay
++  !> installed once they are set. This routine used to be called for every
++  !> single energy/gradient evaluation, i.e. several times per MD step and
++  !> thread. Every call is a syscall that takes the process-wide sighand
++  !> lock, which shows up as pure kernel (system) time once many threads
++  !> hammer it concurrently. Install them exactly once instead.
++  if (signalset) return
+ 
+-subroutine wsigterm !> Recieved by the "kill" pid command
+-  use crest_parameters,only:stderr,stdout
+-  use crest_restartlog,only:dump_restart
+-  use ConfSolv_module
+-  integer :: io
+-  write (stdout,*)
+-  write (stderr,'(" recieved SIGTERM, trying to terminate CREST...")')
+-  !call dump_restart()
+-  call cs_shutdown(io)
+-  call exit(143)
+-  error stop
+-end subroutine wsigterm
+-
+-subroutine wsigkill
+-  use crest_parameters,only:stderr,stdout
+-  use crest_restartlog,only:dump_restart
+-  use ConfSolv_module
+-  integer :: io
+-  !call dump_restart()
+-  call cs_shutdown(io)
+-  call exit(137)
+-  error stop 'CREST recieved SIGKILL.'
+-end subroutine wsigkill
+-
+-subroutine initsignal()
+-  external :: wSIGINT
+-  external :: wSIGTERM
+-  external :: wSIGKILL
+-  external :: wSIGQUIT
+-
+-  call signal(2,wSIGINT)
+-  call signal(3,wSIGQUIT)
+-  call signal(9,wSIGKILL)
+-  call signal(15,wSIGTERM)
+-  call signal(69,wSIGINT)
++  !> SIGKILL (9) can never be caught and 69 is not a Linux signal at all -
++  !> both old call signal(9,...) / signal(69,...) lines were no-ops.
++  call crest_install_signals()
++  signalset = .true.
+ end subroutine initsignal
+ 
