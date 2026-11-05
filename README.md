@@ -1,5 +1,5 @@
 > **非官方修改版 · Unofficial fork**
-> 本仓库是 [crest-lab/crest](https://github.com/crest-lab/crest) 3.0.2 的个人修改版，与 CREST 原作者及开发团队无关。使用问题请在本仓库提出，不要到上游仓库提问；引用 CREST 请按上游 `CITATION.cff`。
+> 本仓库是 [crest-lab/crest](https://github.com/crest-lab/crest) 3.0.2 的个人修改版，引用 CREST 请按上游 `CITATION.cff`。
 > This is an unofficial, locally modified fork of CREST 3.0.2, not affiliated with the upstream CREST developers. Please report issues here rather than upstream, and cite CREST via the upstream `CITATION.cff`.
 
 # CREST 3.0.2 · QW-Zhang-PKU modified (@ Yu group, PKU)
